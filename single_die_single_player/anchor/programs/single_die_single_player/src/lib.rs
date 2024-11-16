@@ -1,162 +1,238 @@
 #![allow(clippy::result_large_err)]
-
 use anchor_lang::prelude::*;
-use anchor_spl::token;
+use anchor_spl::token::{self, Token, TokenAccount};
+// use orao_solana_vrf::state::VrfAccountData;
+// use orao_solana_vrf::*;
 use std::collections::BTreeMap;
-
 
 declare_id!("DLw5fJNrrBCWoy75aukoDApBZm4MEvaWCvPJoqtLSg1p");
 
-const BET_AMOUNT: u64 = 10; // Adjust the bet amount as needed
+const BET_AMOUNT: u64 = 10_000_000; // 0.01 SOL in lamports
 
 #[program]
-pub mod single_die_single_player {
+pub mod single_die_game {
     use super::*;
+    // use orao_solana_vrf::*;
+    // use orao_solana_vrf::{VrfRequestParams, get_randomness};
 
-    use anchor_lang::prelude::*;
-    use anchor_spl::token;
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        let game_account = &mut ctx.accounts.game_account;
+        game_account.rolls = BTreeMap::new();
+        game_account.authority = ctx.accounts.authority.key();
+        Ok(())
+    }
 
     pub fn choose_number(ctx: Context<ChooseNumber>, guess: u8) -> Result<()> {
-        // Program account that stores the game state
-        let game_account = &mut ctx.accounts.game_account;
-        let player_account = &ctx.accounts.player;
+        // Validate the guess
+        require!(guess >= 1 && guess <= 6, ErrorCode::InvalidNumber);
 
-        // Check if the number is valid
-        require!(guess >= 1 && guess <= 6, CustomError::InvalidNumber);
-
+        // Validate funds
+        let player = &ctx.accounts.player;
         require!(
-            player_account.lamports() >= BET_AMOUNT,
-            CustomError::InsufficientFunds
+            ctx.accounts.player_token_account.amount >= BET_AMOUNT,
+            ErrorCode::InsufficientFunds
         );
 
-        // Transfers bet from player to game
+        // Transfer tokens from player to game vault
         token::transfer(
-            ctx.accounts.into_context(token::Transfer {
-                from: player_account.to_account_info(),
-                to: game_account.to_account_info(),
-                authority: player_account.to_account_info(),
-            })?,
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.player_token_account.to_account_info(),
+                    to: ctx.accounts.game_vault.to_account_info(),
+                    authority: player.to_account_info(),
+                },
+            ),
             BET_AMOUNT,
         )?;
 
+        // Create VRF request
+        // let vrf_request = VrfRequestParams {
+        //     callback_program_id: ctx.program_id,
+        //     callback_accounts: vec![
+        //         AccountMeta::new(ctx.accounts.game_account.key(), false),
+        //         AccountMeta::new(ctx.accounts.player.key(), false),
+        //         AccountMeta::new(ctx.accounts.player_token_account.key(), false),
+        //         AccountMeta::new(ctx.accounts.game_vault.key(), false),
+        //     ],
+        //     callback_data: guess.to_le_bytes().to_vec(),
+        // };
+
+        // let vrf_program = ctx.accounts.vrf.to_account_info();
+        // let request_accounts = orao_solana_vrf::cpi::accounts::Request {
+        //     payer: ctx.accounts.player.to_account_info(),
+        //     network_state: ctx.accounts.config.to_account_info(),
+        //     treasury: ctx.accounts.treasury.to_account_info(),
+        //     request: ctx.accounts.request.to_account_info(),
+        //     system_program: ctx.accounts.system_program.to_account_info(),
+        // };
+        // let cpi_ctx = CpiContext::new(vrf_program, request_accounts);
+        // let vrf_key = orao_solana_vrf::cpi::request(cpi_ctx, seed)?;
+
+        // // Request randomness from ORAO
+        // let vrf_key = orao_solana_vrf::get_randomness(
+        //     &ctx.accounts.vrf_program.to_account_info(),
+        //     &ctx.accounts.vrf_account.to_account_info(),
+        //     &vrf_request,
+        // )?;
+
+        // The VRF key is the public key of the request account
+        // let vrf_key = ctx.accounts.request.key();
+
+        // // Make the VRF request
+        // let vrf_program = ctx.accounts.vrf.to_account_info();
+        // let request_accounts = orao_solana_vrf::cpi::accounts::Request {
+        //     payer: ctx.accounts.player.to_account_info(),
+        //     network_state: ctx.accounts.config.to_account_info(),
+        //     treasury: ctx.accounts.treasury.to_account_info(),
+        //     request: ctx.accounts.request.to_account_info(),
+        //     system_program: ctx.accounts.system_program.to_account_info(),
+        // };
+        // let cpi_ctx = CpiContext::new(vrf_program, request_accounts);
+
+        // // Generate a seed for randomness (could be based on timestamp or other factors)
+        // let seed = Clock::get()?.slot.to_le_bytes();
+        // orao_solana_vrf::cpi::request(cpi_ctx, seed)
+        //     .map_err(|e| anchor_lang::error!(ErrorCode::RandomnessRequestFailed))?;
+
+        // // // Store roll data
+        // let game_account = &mut ctx.accounts.game_account;
+        // game_account.rolls.insert(
+        //     vrf_key,
+        //     RollData {
+        //         player: *player.key,
+        //         player_token_account: ctx.accounts.player_token_account.key(),
+        //         guess,
+        //         bet_amount: BET_AMOUNT,
+        //         timestamp: Clock::get()?.unix_timestamp,
+        //     },
+        // );
+
         emit!(PlayerChoseNumber {
-            player: *ctx.accounts.player.key,
+            player: *player.key,
             guess,
             bet_amount: BET_AMOUNT,
-            bet_currency: "SOL".to_string(),
             timestamp: Clock::get()?.unix_timestamp,
         });
 
-        // If this is the sixth player, reveal the winner
-        // if game_account.players.len() == 6 {
+        Ok(())
+    }
 
-        let oracle_queue_account = &ctx.accounts.oracle_queue_account;
+    pub fn settle_game(ctx: Context<SettleGame>, vrf_result: [u8; 32]) -> Result<()> {
+        let game_account = &mut ctx.accounts.game_account;
 
-        let vrf_key = make_orao_vrf_request(
-            ctx.program_id,
-            ctx.accounts.game_account.key(),
-            ctx.accounts.oracle_account.to_account_info(),
-            // settle_game
-        )?;
+        // Get roll data
+        // let roll_data = game_account
+        //     .rolls
+        //     .get(&ctx.accounts.vrf_account.key())
+        //     .ok_or(ErrorCode::InvalidRoll)?;
 
-        game_account.rolls.insert(
-            vrf_key,
-            Player {
-                // address: *player_account.to_account_info().key,
-                account: *player_account.to_account_info(),
-                guess,
-                BET_AMOUNT,
-            },
-        );
+        // // Calculate winning number (1-6)
+        // let winning_number = (u8::from_le_bytes([vrf_result[0]]) % 6) + 1;
 
-        // Request VRF from Switchboard (adapt to your specific Switchboard setup)
-        // let vrf_key = switchboard_program::instruction::request_randomness(
-        //     ctx.accounts.oracle_queue_account.to_account_info(),
-        //     ctx.accounts.game_account.to_account_info(), // Callback address
-        //     // ... other parameters as needed
-        // )?;
+        // if roll_data.guess == winning_number {
+        //     // Calculate prize (4.2x multiplier)
+        //     let prize_amount = BET_AMOUNT + (BET_AMOUNT * 42 / 10);
 
-        // Store the vrf_key in the game account for later retrieval
-        // game_account.vrf_key = vrf_key;
+        //     // Transfer prize
+        //     token::transfer(
+        //         CpiContext::new_with_signer(
+        //             ctx.accounts.token_program.to_account_info(),
+        //             token::Transfer {
+        //                 from: ctx.accounts.game_vault.to_account_info(),
+        //                 to: ctx.accounts.player_token_account.to_account_info(),
+        //                 authority: ctx.accounts.game_account.to_account_info(),
+        //             },
+        //             &[&[
+        //                 b"game",
+        //                 &[*ctx.bumps.get("game_account").unwrap()],
+        //             ]],
+        //         ),
+        //         prize_amount,
+        //     )?;
+
+        // emit!(PlayerWon {
+        //     player: roll_data.player,
+        //     winning_number,
+        //     prize_amount,
+        //     timestamp: Clock::get()?.unix_timestamp,
+        // });
         // }
 
-        Ok(())
-    }
-
-    pub fn settle_game(ctx: Context<SettleGame>) -> Result<()> {
-        let game_account = &mut ctx.accounts.game_account;
-        let vrf_account = &ctx.accounts.vrf_account;
-
-        let result = vrf_account
-            .result
-            .ok_or(CustomError::RandomnessNotAvailable)?;
-
-        let winning_number = (result % 6) + 1;
-
-        let roll_data = game_account
-            .rolls
-            .get(vrf_account.key)
-            .ok_or(CustomError::CouldntReadRoll)?;
-
-        if roll_data.guess == winning_number {
-            let prize_amount = BET_AMOUNT + BET_AMOUNT * 42 / 10; // 4.2x multiplier + original bet
-            token::transfer(
-                ctx.accounts.into_context(token::Transfer {
-                    from: game_account.to_account_info(),
-                    to: roll_data.account,
-                    authority: game_account.to_account_info(),
-                })?,
-                prize_amount,
-            )?;
-
-            emit!(PlayerWon {
-                player: *ctx.accounts.player.key,
-                winning_number,
-                prize_amount,
-                prize_currency: "SOL".to_string(),
-                timestamp: Clock::get()?.unix_timestamp,
-            });
-        }
-
-        if let Some(value) = game_account.rolls.remove(vrf_account.key) {
-            msg!("Removed: {} => {}", vrf_account.key, value);
-        } else {
-            msg!("Key {} not found!", vrf_account.key);
-        }
+        // Clean up
+        game_account.rolls.remove(&ctx.accounts.vrf_account.key());
 
         Ok(())
     }
 }
 
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + 32 + 1000 // Adjust space as needed
+    )]
+    pub game_account: Account<'info, GameState>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ChooseNumber<'info> {
+    #[account(mut)]
+    pub game_account: Account<'info, GameState>,
+    #[account(mut)]
+    pub player: Signer<'info>,
+    #[account(mut)]
+    pub player_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub game_vault: Account<'info, TokenAccount>,
+    /// CHECK: ORAO VRF Program
+    pub vrf_program: AccountInfo<'info>,
+    // pub config: Account<'info, ConfigAccount>,  // Network state/config for VRF
+    /// CHECK: ORAO VRF Account
+    #[account(mut)]
+    pub vrf_account: AccountInfo<'info>,
+    pub request: Account<'info, RequestAccount>, // VRF Request Account
+    pub token_program: Program<'info, Token>,
+}
+
 #[account]
-pub struct ChooseNumber {
-    pub rolls: BTreeMap<Pubkey, Player>,
+pub struct RequestAccount {
+    pub randomness: Option<[u8; 32]>, // Randomness result, if fulfilled.
+    pub requester: Pubkey,           // Account that initiated the request.
+    pub status: u8,                  // Status of the request (e.g., pending, fulfilled).
+    // Other fields specific to the ORAO VRF program.
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
-pub struct Player {
-    pub address: Pubkey,
-    pub guess: u8,
-    pub bet_size: u64,
-}
-
-#[error]
-pub enum CustomError {
-    #[msg("Invalid number- expecting integer between 1 and 6")]
-    InvalidNumber,
-    #[msg("Invalid bet amount")]
-    InvalidBetAmount,
-    #[msg("Insufficient funds")]
-    InsufficientFunds,
-    #[msg("Error reading player's roll")]
-    CouldntReadRoll,
-}
-
-#[account]
+#[derive(Accounts)]
 pub struct SettleGame<'info> {
-    pub game_account: Account<'info, ChooseNumber>,
+    #[account(mut)]
+    pub game_account: Account<'info, GameState>,
+    #[account(mut)]
+    pub player_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub game_vault: Account<'info, TokenAccount>,
+    /// CHECK: ORAO VRF Account
+    pub vrf_account: AccountInfo<'info>,
+    pub token_program: Program<'info, Token>,
+}
 
-    pub oracle_queue_account: Account<'info, VrfAccountData>,
+#[account]
+pub struct GameState {
+    pub authority: Pubkey,
+    pub rolls: BTreeMap<Pubkey, RollData>,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct RollData {
+    pub player: Pubkey,
+    pub player_token_account: Pubkey,
+    pub guess: u8,
+    pub bet_amount: u64,
+    pub timestamp: i64,
 }
 
 #[event]
@@ -164,7 +240,6 @@ pub struct PlayerChoseNumber {
     pub player: Pubkey,
     pub guess: u8,
     pub bet_amount: u64,
-    pub bet_currency: String,
     pub timestamp: i64,
 }
 
@@ -173,37 +248,17 @@ pub struct PlayerWon {
     pub player: Pubkey,
     pub winning_number: u8,
     pub prize_amount: u64,
-    pub prize_currency: String,
     pub timestamp: i64,
 }
 
-/// Helper function to make an ORAO VRF request.
-fn make_orao_vrf_request(
-    program_id: &Pubkey,
-    game_account_key: &Pubkey,
-    vrf_account_info: AccountInfo<'_>,
-) -> Result<Pubkey> {
-    let callback_ix = Instruction {
-        program_id: *program_id,
-        accounts: vec![AccountMeta::new(*game_account_key, false)],
-        // data: number_guessing_game::instruction::SettleGame {},
-        // data: SettleGame {},
-        // maybe this?
-
-        // Get the function discriminator for "settle_game"
-        // let settle_game_discriminator = anchor_lang::sighash("global", "settle_game");
-
-        // // Prepare callback data (8-byte discriminator for "settle_game" and additional parameters)
-        // let callback_data = settle_game_discriminator.to_vec();
-        // data: callback_data,
-    };
-
-    orao_vrf_solana::instruction::request_randomness(
-        vrf_account_info,
-        game_account_key, // Callback address
-        callback_ix,
-    )?;
-
-    // Return the vrf_key (you may need to adapt based on the ORAO setup).
-    Ok(vrf_account_info.key.clone())
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Invalid number - must be between 1 and 6")]
+    InvalidNumber,
+    #[msg("Randomness request failed")]
+    RandomnessRequestFailed,
+    #[msg("Insufficient funds for bet")]
+    InsufficientFunds,
+    #[msg("Invalid roll data")]
+    InvalidRoll,
 }
